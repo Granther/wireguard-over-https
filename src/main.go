@@ -4,55 +4,66 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/exec"
+	"golang.org/x/net/tun"
+)
 
-	"wireguard-go"
-	//wg "github.com/libp2p/go-wireguard"
+const (
+	tunName = "htun0" // Name of the TUN interface
+	mtu     = 1500    // MTU size
 )
 
 func main() {
-	// Define the WireGuard interface configuration
-	config := wg.InterfaceConfig{
-		PrivateKey:  []byte("yC1Vh7EjsbYczHmN3NWRtHGzppAq8tbt/Ug2NrQTKEk="),
-		//PresharedKey: []byte("7sXSTPuOGXNatgSLt3vXPILgiz+lnMNH4w/xBkFyNhU="),
-	}
-
-	// Create a WireGuard interface
-	wgInterface, err := wg.NewInterface(config)
+	// Create a TUN interface
+	tunDev, err := tun.CreateTUN(tunName, mtu)
 	if err != nil {
-		log.Fatalf("Failed to create WireGuard interface: %v", err)
+		log.Fatalf("Failed to create TUN device: %v", err)
 	}
-	defer wgInterface.Close()
+	defer tunDev.Close()
 
-	fmt.Println("WireGuard interface created successfully!")
+	fmt.Printf("TUN device %s created. Listening for packets...\n", tunName)
 
-	// Define a peer
-	peer := &wg.Peer{
-		PublicKey: []byte("cV0fDSWyA/1f2nBKLo2dwyrFEeDjtXyIjlscLK1SCjo="),
-		AllowedIPs: []*net.IPNet{
-			{IP: net.IPv4(10, 0, 0, 1), Mask: net.CIDRMask(32, 32)},
-		},
-		Endpoint: &net.UDPAddr{
-			IP:   net.ParseIP("192.168.1.41"),
-			Port: 51820,
-		},
-		PersistentKeepaliveInterval: 25,
-	}
-
-	// Add the peer to the WireGuard interface
-	err = wgInterface.AddPeer(peer)
+	// Get the TUN device file descriptor
+	tunFd, err := tunDev.File()
 	if err != nil {
-		log.Fatalf("Failed to add peer: %v", err)
+		log.Fatalf("Failed to get TUN device file descriptor: %v", err)
 	}
 
-	fmt.Println("Peer added successfully!")
+	// Configure the TUN interface (Run shell commands)
+	setupTunInterface(tunName)
 
-	// Start the interface
-	err = wgInterface.Run()
-	if err != nil {
-		log.Fatalf("Failed to run WireGuard interface: %v", err)
+	// Read packets from the TUN interface
+	packetBuf := make([]byte, mtu)
+	for {
+		n, err := tunFd.Read(packetBuf)
+		if err != nil {
+			log.Fatalf("Error reading from TUN device: %v", err)
+		}
+
+		fmt.Printf("Received %d bytes from %s\n", n, tunName)
+		fmt.Printf("Packet Data: %x\n", packetBuf[:n]) // Print packet as hex
 	}
+}
 
-	fmt.Println("WireGuard interface is running...")
-	select {} // Keep the program running
+// setupTunInterface sets up the TUN interface and routes traffic
+func setupTunInterface(iface string) {
+	// Set up IP address and bring up interface
+	runCommand("ip", "addr", "add", "10.10.10.1/24", "dev", iface)
+	runCommand("ip", "link", "set", iface, "up")
+
+	// Redirect traffic from wg0 to htun0
+	runCommand("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", iface, "-j", "MASQUERADE")
+	runCommand("iptables", "-A", "FORWARD", "-i", "wg0", "-o", iface, "-j", "ACCEPT")
+	runCommand("iptables", "-A", "FORWARD", "-i", iface, "-o", "wg0", "-j", "ACCEPT")
+
+	fmt.Println("TUN interface setup complete!")
+}
+
+// runCommand executes a system command
+func runCommand(cmd string, args ...string) {
+	if err := exec.Command(cmd, args...).Run(); err != nil {
+		log.Fatalf("Command %s failed: %v", cmd, err)
+	}
 }
 
