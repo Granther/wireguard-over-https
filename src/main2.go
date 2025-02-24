@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"log"
 	"net/http"
 
 	"golang.org/x/net/websocket"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 )
 
 const (
@@ -21,8 +23,8 @@ const (
 )
 
 func main() {
-	//clientRun()
-	serverRun()
+	clientRun()
+	//serverRun()
 }
 
 func serverRun() {
@@ -46,9 +48,56 @@ func clientRun() {
 	  packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	  for packet := range packetSource.Packets() {
 		fmt.Println("Recieved packet destined for peer, writing to WS")
-		ws.Write(packet.Data()) // Send packets over https
-	  }
+		//data := testPacket()
+		//ws.Write(packet.Data()) // Send packets over https
+		//fmt.Println("Recieved packet")
+		if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+		        fmt.Println("Sending UDP payload")
+		        udp, _ := udpLayer.(*layers.UDP)
+		        ws.Write(udp.Payload)
+		    } 
+		}
 	}
+}
+
+func testPacket() []byte {
+	srcIP := net.ParseIP("127.0.0.1")
+	dstIP := net.ParseIP("127.0.0.1")
+	srcPort := layers.UDPPort(52479)
+	dstPort := layers.UDPPort(60885)
+
+	ipLayer := &layers.IPv4{
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
+		Version:  4,
+		TTL:      64,
+		Protocol: layers.IPProtocolUDP,
+	}
+
+	udpLayer := &layers.UDP{
+		SrcPort: srcPort,
+		DstPort: dstPort,
+	}
+
+	// **Important: Set network layer for UDP checksum calculation**
+	udpLayer.SetNetworkLayerForChecksum(ipLayer)
+
+	payload := []byte("Hello, this is a test UDP packet")
+	udpLayer.Payload = payload
+
+	// Recalculate length and checksum
+	if err := udpLayer.SerializeTo(gopacket.NewSerializeBuffer(), gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}); err != nil {
+		log.Fatal(err)
+	}
+
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	err := gopacket.SerializeLayers(buf, opts, ipLayer, udpLayer, gopacket.Payload(payload))
+	if err != nil {
+		log.Fatal(err)
+	}
+	
+	return buf.Bytes()
 }
 
 func awaitWSClient() {
@@ -69,7 +118,19 @@ func awaitWSClient() {
 
 		fmt.Println("Client connected")
 
-		listenWSU(ws)
+		go listenWSU(ws)
+
+		if handle, err := pcap.OpenLive("lo", 1600, true, pcap.BlockForever); err != nil {
+		  panic(err)
+		} else if err := handle.SetBPFFilter(fmt.Sprintf("port %s", PEER_WG_PORT)); err != nil { 
+		  panic(err)
+		} else {
+		  packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+		  for packet := range packetSource.Packets() {
+			fmt.Println("Recieved packet destined for peer, writing to WS")
+			ws.WriteMessage(gws.BinaryMessage, packet.Data()) // Send packets over https
+		  }
+		}
 	}
 
 	http.HandleFunc("/ws", handleWS)
@@ -102,7 +163,12 @@ func listenWS(ws *websocket.Conn) {
 }
 
 func sendToWG(data []byte) error {
-	serverAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%s", LOCAL_WG_PORT))
+	//packet := gopacket.NewPacket(data, layers.LayerTypeUDP, gopacket.Default)
+	//fmt.Println("Packet: ", packet, "Len: ", len(data))
+
+	//data = packet.TransportLayer().Payload()
+
+	serverAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("0.0.0.0:%s", LOCAL_WG_PORT))
 	if err != nil { return fmt.Errorf("Unable to resolve udp addr for localhost:%s: %w", LOCAL_WG_PORT, err) }
 	
 	// Create udp conn
