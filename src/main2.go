@@ -15,11 +15,13 @@ import (
 )
 
 const (
-	LOCAL_WG_PORT = "52479"
+	LOCAL_WG_PORT = "58938"
 	PEER_WG_PORT = "60885"
 	WS_PORT = "8080"
 	PEER_PUB_IP = "192.168.1.41"
+	PEER_WG_IP = "10.0.0.2"
 	MY_PUB_IP = "127.0.0.1"
+	MY_WG_IP = "10.0.0.1"
 )
 
 func main() {
@@ -49,13 +51,13 @@ func clientRun() {
 	  for packet := range packetSource.Packets() {
 		fmt.Println("Recieved packet destined for peer, writing to WS")
 		//data := testPacket()
-		//ws.Write(packet.Data()) // Send packets over https
+		ws.Write(packet.Data()) // Send packets over https
 		//fmt.Println("Recieved packet")
-		if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-		        fmt.Println("Sending UDP payload")
-		        udp, _ := udpLayer.(*layers.UDP)
-		        ws.Write(udp.Payload)
-		    } 
+		//if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+		//       fmt.Println("Sending UDP payload")
+		//       udp, _ := udpLayer.(*layers.UDP)
+		//       ws.Write(udp.Payload)
+		//    } 
 		}
 	}
 }
@@ -133,7 +135,7 @@ func awaitWSClient() {
 		}
 	}
 
-	http.HandleFunc("/ws", handleWS)
+	 http.HandleFunc("/ws", handleWS)
 	panic(http.ListenAndServe(fmt.Sprintf(":%s", WS_PORT), nil))
 }
 
@@ -156,10 +158,73 @@ func listenWS(ws *websocket.Conn) {
 		if err != nil { fmt.Println("Error reading from websocket"); continue }
 		fmt.Println("Got message from peer on websocket, sending to wireguard...")
 
-		err = sendToWG(msg[:n])
+		//err = sendToWG(msg[:n])
+		err = sendToWGHandle(msg[:n])
 		if err != nil { fmt.Printf("Unable to successfully send data to WG locally: %w\n", err); continue }
 		fmt.Printf("Sent msg to local wireguard at localhost:%s\n", LOCAL_WG_PORT)
 	}
+}
+
+func sendToWGHandle(data []byte) error {
+    // Open the interface for packet injection
+    handle, err := pcap.OpenLive("lo", 65536, true, pcap.BlockForever)
+    if err != nil {
+        return fmt.Errorf("failed to open interface for injection: %w", err)
+    }
+    defer handle.Close()
+
+    newPacket, err := modifyIP(data, "127.0.0.1", MY_WG_IP)
+    if err != nil { return fmt.Errorf("Unable to relable packet's IPs") }
+
+    // Inject the raw packet
+    if err := handle.WritePacketData(newPacket); err != nil {
+        return fmt.Errorf("failed to inject packet: %w", err)
+    }
+    
+    return nil	
+}
+
+func modifyIP(packetBytes []byte, newSrcIP, newDstIP string) ([]byte, error) {
+	// Decode the packet
+	packet := gopacket.NewPacket(packetBytes, layers.LayerTypeIPv4, gopacket.Default)
+	
+	ipLayer := &layers.IPv4{
+		Version:  4,
+		TTL:      64,
+		Protocol: layers.IPProtocolICMPv4,
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
+		IHL:      5,
+	}	
+
+//	ipLayer := packet.Layer(layers.LayerTypeIPv4)
+//	if ipLayer == nil {
+//		return nil, fmt.Errorf("no IPv4 layer found in packet")
+//	}
+
+	// Cast to IPv4 struct
+//	ip, _ := ipLayer.(*layers.IPv4)
+
+	// Modify source and destination IPs
+//	ip.SrcIP = net.ParseIP(newSrcIP)
+//	ip.DstIP = net.ParseIP(newDstIP)
+
+	// Serialize the modified IP layer back to bytes
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{
+		ComputeChecksums: true, // Recalculate checksum
+		FixLengths:       true, // Fix total length fields
+	}
+
+	err := ipLayer.SerializeTo(buf, opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize modified IP layer: %v", err)
+	}
+
+	// Replace the IP header bytes in the original packet
+	copy(packetBytes[:len(buf.Bytes())], buf.Bytes())
+
+	return packetBytes, nil
 }
 
 func sendToWG(data []byte) error {
