@@ -5,6 +5,7 @@ import (
 	"net"
 	"log"
 	"net/http"
+	"syscall"
 
 	"golang.org/x/net/websocket"
 	gws "github.com/gorilla/websocket"
@@ -15,7 +16,7 @@ import (
 )
 
 const (
-	LOCAL_WG_PORT = "58938"
+	LOCAL_WG_PORT = "55357"
 	PEER_WG_PORT = "60885"
 	WS_PORT = "8080"
 	PEER_PUB_IP = "192.168.1.41"
@@ -159,35 +160,66 @@ func listenWS(ws *websocket.Conn) {
 		fmt.Println("Got message from peer on websocket, sending to wireguard...")
 
 		//err = sendToWG(msg[:n])
-		err = sendToWGHandle(msg[:n])
+		//err = sendToWGHandle(msg[:n])
+		err = sendToWGSock(msg[:n])
 		if err != nil { fmt.Printf("Unable to successfully send data to WG locally: %w\n", err); continue }
 		fmt.Printf("Sent msg to local wireguard at localhost:%s\n", LOCAL_WG_PORT)
 	}
 }
 
+func sendToWGSock(data []byte) error {
+	ifaceName := "wg0"
+	//dstIP := net.ParseIP(MY_WG_IP)
+
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
+	if err != nil { return fmt.Errorf("Unable to open fd for socket") }
+	defer syscall.Close(fd)
+
+	//err = syscall.BindToDevice(fd, ifaceName)
+	srcAddr := &syscall.SockaddrInet4{
+		Port: 55357,
+		Addr: [4]byte{0,0,0,0},
+	}
+	err = syscall.Bind(fd, srcAddr)
+	if err != nil { return fmt.Errorf("Unable to bind srcAddr
+
+	if err != nil { return fmt.Errorf("Unable to bind fd to iface: %s: %w", ifaceName, err) }
+
+	dstAddr := &syscall.SockaddrInet4{
+		Port: 55357,
+		Addr: [4]byte{0, 0, 0, 0},
+	}
+	//copy(dstAddr.Addr[:], dstIP.To4())
+
+	if err := syscall.Sendto(fd, data, 0, dstAddr); err != nil {
+		return fmt.Errorf("Unable to send packet on socket: %s") 
+	}
+	
+	fmt.Println("Sent packet on socket to local WG")
+	return nil
+}
+
 func sendToWGHandle(data []byte) error {
     // Open the interface for packet injection
-    handle, err := pcap.OpenLive("lo", 65536, true, pcap.BlockForever)
+    handle, err := pcap.OpenLive("wg0", 65536, true, pcap.BlockForever)
     if err != nil {
         return fmt.Errorf("failed to open interface for injection: %w", err)
     }
     defer handle.Close()
 
-    newPacket, err := modifyIP(data, "127.0.0.1", MY_WG_IP)
-    if err != nil { return fmt.Errorf("Unable to relable packet's IPs") }
+    //newPacket, err := modifyIP(data, "127.0.0.1", MY_WG_IP)
+    //if err != nil { return fmt.Errorf("Unable to relable packet's IPs") }
 
     // Inject the raw packet
-    if err := handle.WritePacketData(newPacket); err != nil {
+    if err := handle.WritePacketData(data); err != nil {
         return fmt.Errorf("failed to inject packet: %w", err)
     }
     
     return nil	
 }
 
-func modifyIP(packetBytes []byte, newSrcIP, newDstIP string) ([]byte, error) {
-	// Decode the packet
-	packet := gopacket.NewPacket(packetBytes, layers.LayerTypeIPv4, gopacket.Default)
-	
+func createPingPacket(srcIP, dstIP net.IP) ([]byte, error) {
+	// Initialize IPv4 layer
 	ipLayer := &layers.IPv4{
 		Version:  4,
 		TTL:      64,
@@ -195,7 +227,58 @@ func modifyIP(packetBytes []byte, newSrcIP, newDstIP string) ([]byte, error) {
 		SrcIP:    srcIP,
 		DstIP:    dstIP,
 		IHL:      5,
-	}	
+	}
+
+	// Initialize ICMP layer (Echo Request)
+	icmpLayer := &layers.ICMPv4{
+		TypeCode: layers.CreateICMPv4TypeCode(layers.ICMPv4TypeEchoRequest, 0),
+		Id:       1234, // ID for tracking the request/reply
+		Seq:      1,    // Sequence number
+	}
+
+	// Payload for the ICMP packet
+	payload := []byte("WIREPACKETTEST")
+
+	// Create serialization buffer
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{
+		ComputeChecksums: true,
+		FixLengths:       true,
+	}
+
+	// Serialize all layers
+	err := gopacket.SerializeLayers(buf, opts,
+		ipLayer,
+		icmpLayer,
+		gopacket.Payload(payload),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize packet: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+func modifyIP(packetBytes []byte, newSrcIP, newDstIP string) ([]byte, error) {
+	// Decode the packet
+//	packet := gopacket.NewPacket(packetBytes, layers.LayerTypeIPv4, gopacket.Default)
+	
+	packBytes, err := createPingPacket(net.ParseIP(newSrcIP), net.ParseIP(newDstIP))
+	if err != nil { return nil, fmt.Errorf("Unable to create ping bytes") }
+	packet := gopacket.NewPacket(packBytes, layers.LayerTypeIPv4, gopacket.Default)
+
+	fmt.Println("Packet: ", packet)
+
+	return packBytes, nil
+
+//	ipLayer := &layers.IPv4{
+//		Version:  4,
+//		TTL:      64,
+//		Protocol: layers.IPProtocolICMPv4,
+//		SrcIP:    srcIP,
+//		DstIP:    dstIP,
+//		IHL:      5,
+//	}	
 
 //	ipLayer := packet.Layer(layers.LayerTypeIPv4)
 //	if ipLayer == nil {
@@ -210,21 +293,21 @@ func modifyIP(packetBytes []byte, newSrcIP, newDstIP string) ([]byte, error) {
 //	ip.DstIP = net.ParseIP(newDstIP)
 
 	// Serialize the modified IP layer back to bytes
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{
-		ComputeChecksums: true, // Recalculate checksum
-		FixLengths:       true, // Fix total length fields
-	}
+//	buf := gopacket.NewSerializeBuffer()
+//	opts := gopacket.SerializeOptions{
+//		ComputeChecksums: true, // Recalculate checksum
+//		FixLengths:       true, // Fix total length fields
+//	}
 
-	err := ipLayer.SerializeTo(buf, opts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize modified IP layer: %v", err)
-	}
+//	err := ipLayer.SerializeTo(buf, opts)
+//	if err != nil {
+//		return nil, fmt.Errorf("failed to serialize modified IP layer: %v", err)
+//	}
 
 	// Replace the IP header bytes in the original packet
-	copy(packetBytes[:len(buf.Bytes())], buf.Bytes())
+//	copy(packetBytes[:len(buf.Bytes())], buf.Bytes())
 
-	return packetBytes, nil
+//	return packetBytes, nil
 }
 
 func sendToWG(data []byte) error {
